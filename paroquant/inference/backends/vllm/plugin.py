@@ -5,13 +5,22 @@ from copy import deepcopy
 import torch
 from torch.nn import Parameter
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.layer import (
+    FusedMoE,
+    UnquantizedFusedMoEMethod,
+)
 from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization import register_quantization_config
-from vllm.model_executor.layers.quantization.awq_marlin import AWQMarlinLinearMethod
+from vllm.model_executor.layers.quantization.awq_marlin import (
+    AWQMarlinLinearMethod,
+    AWQMarlinMoEMethod,
+)
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     apply_awq_marlin_linear,
     check_marlin_supports_layer,
+    check_moe_marlin_supports_layer,
+    get_marlin_input_dtype,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 from vllm.scalar_type import scalar_types
@@ -88,6 +97,14 @@ class ParoQuantConfig(QuantizationConfig):
         self.krot = krot
         self.pack_factor = 32 // bits
         self.quant_type = _QUANT_TYPE[bits]
+        # AWQMarlinMoEMethod expects an AWQMarlinConfig-like object.
+        self.weight_bits = bits
+        self.full_config = {
+            "bits": bits,
+            "group_size": group_size,
+            "zero_point": zero_point,
+            "quant_method": "awq",
+        }
         # We rely on the existance of `qweight` etc. to determin the skipped layers.
         self.modules_to_not_convert = None
         self.zero_point = zero_point
@@ -151,6 +168,22 @@ class ParoQuantConfig(QuantizationConfig):
         self.modules_to_not_convert = [_strip(k) for k in leaf_modules - quant_modules]
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str) -> LinearMethodBase | None:
+        # vLLM's Qwen MoE layers are FusedMoE/SharedFusedMoE, not LinearBase.
+        # Without this branch vLLM falls back to UnquantizedFusedMoEMethod,
+        # which allocates the large BF16 expert tensors that OOM on 24 GB GPUs.
+        if isinstance(layer, FusedMoE):
+            if is_layer_skipped(prefix, self.modules_to_not_convert, skip_with_substr=True):
+                return UnquantizedFusedMoEMethod(layer.moe_config)
+            if not check_moe_marlin_supports_layer(layer, self.group_size):
+                logger.warning_once(
+                    "MoE layer '%s' is not supported by AWQ-Marlin MoE. Falling back to unquantized.",
+                    prefix,
+                )
+                return UnquantizedFusedMoEMethod(layer.moe_config)
+            method = ParoQuantGateUpRotatedMoEMethod(self, layer.moe_config)
+            method.input_dtype = get_marlin_input_dtype(prefix)
+            return method
+
         if not isinstance(layer, LinearBase):
             return None
         if is_layer_skipped(prefix, self.modules_to_not_convert, self.packed_modules_mapping, skip_with_substr=True):
@@ -162,6 +195,163 @@ class ParoQuantConfig(QuantizationConfig):
             )
             return UnquantizedLinearMethod()
         return ParoQuantLinearMethod(self)
+
+
+class ParoQuantGateUpRotatedMoEMethod(AWQMarlinMoEMethod):
+    """Graph-safe ParoQuant MoE compromise.
+
+    This keeps vLLM's high-performance AWQ-Marlin fused MoE path, but restores
+    the ParoQuant gate/up input rotation for routed experts. The down-projection
+    rotation is loaded and kept on the module for inspection/future fused-kernel
+    work, but it is not applied here because doing so correctly requires access
+    to the post-activation expert-local intermediate inside the fused MoE kernel.
+
+    Accuracy tradeoff versus the pure boot patch:
+      - Restores the first ParoQuant rotation: hidden_states -> gate/up experts.
+      - Still omits the second rotation: activated expert state -> down experts.
+
+    Performance tradeoff versus the pure boot patch:
+      - Adds one graph-capturable rotation op before fused MoE.
+      - Preserves CUDA graphs and vLLM's fused Marlin MoE execution.
+    """
+
+    def __init__(self, quant_config: ParoQuantConfig, moe) -> None:
+        super().__init__(quant_config, moe)
+
+    def _register_rotation_parameter(
+        self,
+        layer: torch.nn.Module,
+        name: str,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        init: str,
+    ) -> None:
+        if init == "ones":
+            data = torch.ones(shape, dtype=dtype)
+        elif init == "zeros":
+            data = torch.zeros(shape, dtype=dtype)
+        else:
+            raise ValueError(f"Unknown init mode: {init}")
+        param = Parameter(data, requires_grad=False)
+        param.weight_loader = _rotation_weight_loader
+        layer.register_parameter(name, param)
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        super().create_weights(
+            layer=layer,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=intermediate_size_per_partition,
+            params_dtype=params_dtype,
+            **extra_weight_attrs,
+        )
+
+        krot = self.quant_config.krot
+
+        # These names intentionally match ParoQuant's converted checkpoint keys:
+        #   layers.N.mlp.experts.gate_up_weight_*
+        #   layers.N.mlp.experts.down_weight_*
+        # so vLLM's ordinary parameter loader can find them.
+        self._register_rotation_parameter(
+            layer,
+            "gate_up_weight_theta",
+            (krot, hidden_size // 2),
+            torch.float16,
+            "zeros",
+        )
+        self._register_rotation_parameter(
+            layer,
+            "gate_up_weight_pairs",
+            (krot, hidden_size),
+            torch.int16,
+            "zeros",
+        )
+        self._register_rotation_parameter(
+            layer,
+            "gate_up_weight_channel_scales",
+            (1, hidden_size),
+            torch.float16,
+            "ones",
+        )
+
+        self._register_rotation_parameter(
+            layer,
+            "down_weight_theta",
+            (krot, intermediate_size_per_partition // 2),
+            torch.float16,
+            "zeros",
+        )
+        self._register_rotation_parameter(
+            layer,
+            "down_weight_pairs",
+            (krot, intermediate_size_per_partition),
+            torch.int16,
+            "zeros",
+        )
+        self._register_rotation_parameter(
+            layer,
+            "down_weight_channel_scales",
+            (1, intermediate_size_per_partition),
+            torch.float16,
+            "ones",
+        )
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        super().process_weights_after_loading(layer)
+
+        # Keep rotation tensors as plain tensor attributes. This mirrors
+        # ParoQuantLinearMethod and avoids treating these small metadata tensors
+        # as expert weights later. Force them onto the same device as the routed
+        # expert weights; CPU offload should not move these runtime metadata tensors.
+        device = layer.w13_qweight.device
+        layer.gate_up_rot_theta = layer.gate_up_weight_theta.data.to(device=device, non_blocking=True)
+        layer.gate_up_rot_pairs = layer.gate_up_weight_pairs.data.to(device=device, non_blocking=True)
+        layer.gate_up_rot_scales = layer.gate_up_weight_channel_scales.data.to(device=device, non_blocking=True)
+
+        # Loaded for completeness/future kernel work. Not applied in this
+        # graph-safe compromise because the correct insertion point is inside
+        # the fused MoE down-projection path.
+        layer.down_rot_theta = layer.down_weight_theta.data.to(device=device, non_blocking=True)
+        layer.down_rot_pairs = layer.down_weight_pairs.data.to(device=device, non_blocking=True)
+        layer.down_rot_scales = layer.down_weight_channel_scales.data.to(device=device, non_blocking=True)
+
+        del layer.gate_up_weight_theta
+        del layer.gate_up_weight_pairs
+        del layer.gate_up_weight_channel_scales
+        del layer.down_weight_theta
+        del layer.down_weight_pairs
+        del layer.down_weight_channel_scales
+
+    def apply(
+        self,
+        layer: FusedMoE,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts_input: torch.Tensor | None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if hasattr(layer, "gate_up_rot_pairs"):
+            x = torch.ops.rotation.rotate(
+                x,
+                layer.gate_up_rot_pairs,
+                layer.gate_up_rot_theta,
+                layer.gate_up_rot_scales,
+            )
+        return super().apply(
+            layer=layer,
+            x=x,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            shared_experts_input=shared_experts_input,
+        )
 
 
 class ParoQuantLinearMethod(AWQMarlinLinearMethod):
@@ -309,3 +499,6 @@ class ParoQuantLinearMethod(AWQMarlinLinearMethod):
         if bias is not None:
             result = result + bias
         return result
+
+
+
