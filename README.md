@@ -25,6 +25,9 @@ pip install "paroquant[vllm]" "vllm==0.19.1" \
   --extra-index-url https://wheels.vllm.ai/0.19.1/cu130 \
   --extra-index-url https://download.pytorch.org/whl/cu130
 
+# REPLACE your plugin.py (in official vllm 0.19.1 image its locatad at /usr/local/lib/python3.12/dist-packages/paroquant/inference/backends/vllm/plugin.py)
+# with modified version -> https://github.com/remixer-dec/paroquant-24gb/blob/main/paroquant/inference/backends/vllm/plugin.py
+
 # Apple Silicon
 pip install "paroquant[mlx]"
 ```
