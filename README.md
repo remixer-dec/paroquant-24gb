@@ -10,6 +10,7 @@
 </p>
 
 State-of-the-art INT4 quantization for LLMs. ParoQuant uses learned pairwise rotations to suppress weight outliers, closing the accuracy gap with FP16 while running at near-AWQ speed. Supports NVIDIA GPUs (vLLM, Transformers) and Apple Silicon (MLX).
+This fork allows to load models like Qwen 3.6 35B-A3B in vllm on GPUs with 24GB vRAM. Under heavy prefill load I was able to get up to 11000t/s at prefill stage, and around 150t/s at generation stage
 
 ## Quick Start
 
